@@ -649,14 +649,32 @@ public final class Actor {
       set.add(msgId);
     }
     setsForDead.put(senderId, set);
+    reconsiderFlushes();
+  }
 
-    // Check if we have received the flush set from ALL alive members (except the dead one)
-    List<String> currentMembers = group.members();
-    Set<String> expectedSurvivors = new HashSet<String>(currentMembers);
-    expectedSurvivors.remove(crashedId);
-
-    if (setsForDead.keySet().containsAll(expectedSurvivors)) {
-      executeIntersectionRule(crashedId, setsForDead, expectedSurvivors);
+  /**
+   * A flush is complete when every member that is not already known dead has sent its set.
+   * Two crashes at once must not wait for each other. Removing one dead member can unblock
+   * the flush of another, so this repeats until nothing else can finish.
+   */
+  private void reconsiderFlushes() {
+    boolean progressed = true;
+    while (progressed) {
+      progressed = false;
+      List<String> open = new ArrayList<String>(flushSets.keySet());
+      for (int i = 0; i < open.size(); i++) {
+        String crashedId = open.get(i);
+        Map<String, Set<Long>> setsForDead = flushSets.get(crashedId);
+        if (setsForDead == null || !group.members().contains(crashedId))
+          continue;
+        Set<String> expectedSurvivors = new HashSet<String>(group.members());
+        expectedSurvivors.removeAll(flushingDeadActors);
+        if (setsForDead.keySet().containsAll(expectedSurvivors)) {
+          executeIntersectionRule(crashedId, setsForDead, expectedSurvivors);
+          progressed = true;
+          break;
+        }
+      }
     }
   }
   

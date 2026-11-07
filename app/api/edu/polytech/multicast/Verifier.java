@@ -224,7 +224,8 @@ public final class Verifier {
 	    
     for (String actorId : survivorIds) {
       List<Delivery> deliveries = byActor.get(actorId);
-      if (deliveries == null) continue;
+      if (deliveries == null)
+        throw new AssertionError(actorId + " is listed as a survivor but delivered nothing");
 
       if (reference == null) {
         reference = deliveries;
