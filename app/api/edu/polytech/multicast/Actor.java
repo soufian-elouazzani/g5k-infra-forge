@@ -15,6 +15,7 @@ import edu.polytech.queues.QueueBroker.ConnectListener;
 import edu.polytech.queues.Task;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -64,12 +65,20 @@ public final class Actor {
    final long subjectGeneration;
    final Set<String> expected = new HashSet<String>();
    final Map<String, MulticastMessage.ViewFlush> replies = new HashMap<String, MulticastMessage.ViewFlush>();
+   final Set<String> connecting = new HashSet<String>();
+   byte[] ownRequest;
+   byte[] ownFlush;
+   /** True once a member has announced the full view. The returning actor must not guess it. */
+   boolean membershipKnown;
 
    ViewChange(String subjectId, long subjectGeneration) {
      this.subjectId = subjectId;
      this.subjectGeneration = subjectGeneration;
    }
  }
+
+ /** Actor id to the generation that died while that actor was outside the view. */
+ private final Map<String, Long> deadOutsideView = new HashMap<String, Long>();
 
  private ViewChange viewChange;
  /** True from our answer to a view change until the new view is installed: we do not multicast. */
@@ -105,6 +114,11 @@ public final class Actor {
     
   public String id() {
     return id;
+  }
+
+  /** A copy of the member ids this actor currently has in its view. */
+  public List<String> view() {
+    return new ArrayList<String>(group.members());
   }
 
   public Task task() {
@@ -225,24 +239,28 @@ public final class Actor {
    */
   private void beginOwnReinsertion() {
     ViewChange change = new ViewChange(id, generationId);
-    change.expected.addAll(peers.keySet());
     change.expected.add(id);
     viewChange = change;
     long timestamp = task.logicalClock();
+    String[] members = new String[] { id };
     byte[] request = MulticastMessage.encodeReinsertRequest(id, generationId, timestamp);
-    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, id, generationId, timestamp);
+    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, id, generationId, timestamp, members);
+    change.ownRequest = request;
+    change.ownFlush = flush;
     for (MessageQueue peer : peers.values()) {
       peer.send(request, 0, request.length, null);
       peer.send(flush, 0, flush.length, null);
     }
-    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, id, generationId, timestamp));
+    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, id, generationId, timestamp, members));
     completeOwnReinsertionIfReady();
   }
 
   /** The respawned actor is back in the view. It never delivers a message with a timestamp <= V. */
   private void completeOwnReinsertionIfReady() {
     ViewChange change = viewChange;
-    if (change == null || !change.replies.keySet().containsAll(change.expected))
+    if (change == null || !change.membershipKnown || !change.replies.keySet().containsAll(change.expected))
+      return;
+    if (!peersCover(change))
       return;
     long view = viewTimestamp(change);
     task.witness(view);
@@ -273,6 +291,7 @@ public final class Actor {
         tryDeliver();
       }
     });
+    redispatchDeferredViewMessages();
   }
 
   /** A member receives a reinsertion request or an answer to a view change. */
@@ -284,9 +303,14 @@ public final class Actor {
     if (state == State.RESPAWNED) { // we only wait for the answers to our own request
       if (message instanceof MulticastMessage.ViewFlush && viewChange != null) {
         MulticastMessage.ViewFlush reply = (MulticastMessage.ViewFlush) message;
-        viewChange.replies.put(reply.senderId, reply);
-        completeOwnReinsertionIfReady();
+        if (reply.subjectId.equals(viewChange.subjectId) && reply.subjectGeneration == viewChange.subjectGeneration) {
+          learnMembership(reply);
+          viewChange.replies.put(reply.senderId, reply);
+          completeOwnReinsertionIfReady();
+          return;
+        }
       }
+      deferredViewMessages.add(message); // another returnee: handle it once we are in the view
       return;
     }
     if (state != State.IN_VIEW)
@@ -305,6 +329,9 @@ public final class Actor {
         deferredViewMessages.add(message); // we have not finished the crash flush of this actor yet
         return;
       }
+      Long deadGeneration = deadOutsideView.get(subject);
+      if (deadGeneration != null && deadGeneration.longValue() == subjectGeneration)
+        return; // this life died before the view change finished
       beginViewChange(subject, subjectGeneration);
     } else if (!viewChange.subjectId.equals(subject) || viewChange.subjectGeneration != subjectGeneration) {
       deferredViewMessages.add(message); // one view change at a time
@@ -326,12 +353,78 @@ public final class Actor {
     frozen = true;
     long timestamp = task.logicalClock();
     observe(id, timestamp);
-    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, subject, subjectGeneration, timestamp);
+    String[] members = sortedIds(change.expected);
+    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, subject, subjectGeneration, timestamp, members);
+    change.ownFlush = flush;
     broadcast(flush);
     MessageQueue back = rejoinQueues.get(subject);
     if (back != null)
       back.send(flush, 0, flush.length, null);
-    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, subject, subjectGeneration, timestamp));
+    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, subject, subjectGeneration, timestamp, members));
+  }
+
+  /** A survivor's flush tells the returning actor who belongs in the view. Connect to anyone still missing. */
+  private void learnMembership(MulticastMessage.ViewFlush reply) {
+    ViewChange change = viewChange;
+    if (change == null || reply.senderId.equals(id) || reply.members.length == 0)
+      return;
+    change.membershipKnown = true;
+    for (String memberId : reply.members) {
+      change.expected.add(memberId);
+      if (memberId.equals(id) || peers.containsKey(memberId) || change.connecting.contains(memberId))
+        continue;
+      Actor other = memberById(memberId);
+      if (other != null)
+        connectReturningTo(other);
+    }
+  }
+
+  private boolean peersCover(ViewChange change) {
+    for (String memberId : change.expected) {
+      if (!memberId.equals(id) && !peers.containsKey(memberId))
+        return false;
+    }
+    return true;
+  }
+
+  private Actor memberById(String actorId) {
+    for (Actor member : members)
+      if (member.id.equals(actorId))
+        return member;
+    return null;
+  }
+
+  private static String[] sortedIds(Set<String> ids) {
+    String[] members = ids.toArray(new String[ids.size()]);
+    Arrays.sort(members);
+    return members;
+  }
+
+  private void connectReturningTo(final Actor other) {
+    ViewChange change = viewChange;
+    if (change == null || other == this)
+      return;
+    change.connecting.add(other.id);
+    boolean started = broker.connect(other.brokerName(), REJOIN_PORT_BASE + index, new ConnectListener() {
+      @Override
+      public void connected(MessageQueue queue) {
+        peers.put(other.id, queue);
+        queue.setListener(listener());
+        ViewChange current = viewChange;
+        if (current != null && current.ownRequest != null && current.ownFlush != null) {
+          queue.send(current.ownRequest, 0, current.ownRequest.length, null);
+          queue.send(current.ownFlush, 0, current.ownFlush.length, null);
+        }
+        completeOwnReinsertionIfReady();
+      }
+
+      @Override
+      public void refused() {
+        throw new IllegalStateException(id + " was refused by " + other.id);
+      }
+    });
+    if (!started)
+      throw new IllegalStateException(id + " could not reach " + other.id);
   }
 
   /**
@@ -475,10 +568,13 @@ public final class Actor {
 	      final String peerId = members[other].id;
 	      boolean bound = broker.bind(REJOIN_PORT_BASE + other, new BindListener() {
 	        @Override
-	        public void accepted(MessageQueue queue) {
-	          rejoinQueues.put(peerId, queue);
-	          queue.setListener(listener());
-	        }
+        public void accepted(MessageQueue queue) {
+          rejoinQueues.put(peerId, queue);
+          queue.setListener(listener());
+          ViewChange change = viewChange;
+          if (change != null && change.ownFlush != null && peerId.equals(change.subjectId))
+            queue.send(change.ownFlush, 0, change.ownFlush.length, null);
+        }
 
 	        @Override
 	        public void unbound() {
@@ -508,6 +604,7 @@ public final class Actor {
 	    reinserting = false;              
 	    deferredViewMessages.clear();     
 	    deferredSends.clear();
+	    deadOutsideView.clear();
 	    sent = messagesToSend; // the new life does not replay the periodic load
 	    manualSent = 0;
 	    broker = task.newBroker(brokerName); // a broker name can not be used twice
@@ -589,8 +686,16 @@ public final class Actor {
   void onCrashNotice(String crashedId) {
 	  if (state != State.IN_VIEW)
 		  return; // outside the view: not part of the flush
+    if (!group.members().contains(crashedId)) {
+      Actor crashed = memberById(crashedId);
+      if (crashed != null)
+        deadOutsideView.put(crashedId, Long.valueOf(crashed.generationId()));
+      if (viewChange != null && crashedId.equals(viewChange.subjectId))
+        abortViewChange(crashedId);
+      return;
+    }
     try {
-      if (!group.members().contains(crashedId) || flushingDeadActors.contains(crashedId)) {
+      if (flushingDeadActors.contains(crashedId)) {
         return;
       }
 	      
@@ -705,7 +810,44 @@ public final class Actor {
 
     // 5. With the dead actor gone from the view, the stability rule will now pass. Try to deliver!
     tryDeliver();
-    redispatchDeferredViewMessages(); // a reinsertion request may have been waiting for this crash flush
+    redispatchDeferredViewMessages();
+  }
+
+  /** The actor we were reinserting died before it joined the view. Do not install it, and deliver again. */
+  private void abortViewChange(String crashedId) {
+    viewChange = null;
+    frozen = false;
+    List<Object> kept = new ArrayList<Object>();
+    for (Object message : deferredViewMessages) {
+      if (!crashedId.equals(subjectOf(message)))
+        kept.add(message);
+    }
+    deferredViewMessages.clear();
+    deferredViewMessages.addAll(kept);
+    tryDeliver();
+    replayDeferredSends();
+    redispatchDeferredViewMessages();
+  }
+
+  private void replayDeferredSends() {
+    List<byte[]> sends = new ArrayList<byte[]>(deferredSends);
+    deferredSends.clear();
+    for (final byte[] payload : sends) {
+      task.post(new Runnable() {
+        @Override
+        public void run() {
+          sendManual(payload);
+        }
+      });
+    }
+  }
+
+  private static String subjectOf(Object message) {
+    if (message instanceof MulticastMessage.ReinsertRequest)
+      return ((MulticastMessage.ReinsertRequest) message).requesterId;
+    if (message instanceof MulticastMessage.ViewFlush)
+      return ((MulticastMessage.ViewFlush) message).subjectId;
+    return null;
   }
   
   private void link(String peerId, MessageQueue queue) {

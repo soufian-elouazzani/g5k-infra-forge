@@ -168,8 +168,18 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
         }
         if (kind == REINSERT_REQUEST)
             return new ReinsertRequest(in.readUTF(), in.readLong(), in.readLong());
-        if (kind == VIEW_FLUSH)
-            return new ViewFlush(in.readUTF(), in.readLong(), in.readUTF(), in.readLong(), in.readLong());
+        if (kind == VIEW_FLUSH) {
+            String senderId = in.readUTF();
+            long senderGeneration = in.readLong();
+            String subjectId = in.readUTF();
+            long subjectGeneration = in.readLong();
+            long lamportTimestamp = in.readLong();
+            int memberCount = in.readInt();
+            String[] members = new String[memberCount];
+            for (int i = 0; i < memberCount; i++)
+              members[i] = in.readUTF();
+            return new ViewFlush(senderId, senderGeneration, subjectId, subjectGeneration, lamportTimestamp, members);
+        }
         throw new IllegalArgumentException("unknown message kind " + kind);
     } catch (IOException ex) {
     	throw new IllegalArgumentException(ex);
@@ -194,13 +204,17 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	    final String subjectId;
 	    final long subjectGeneration;
 	    final long lamportTimestamp;
+	    /** Member ids of the view this flush installs, subject included. */
+	    final String[] members;
 
-	    ViewFlush(String senderId, long senderGeneration, String subjectId, long subjectGeneration,long lamportTimestamp) {
+	    ViewFlush(String senderId, long senderGeneration, String subjectId, long subjectGeneration,
+	        long lamportTimestamp, String[] members) {
 	      this.senderId = senderId;
 	      this.senderGeneration = senderGeneration;
 	      this.subjectId = subjectId;
 	      this.subjectGeneration = subjectGeneration;
 	      this.lamportTimestamp = lamportTimestamp;
+	      this.members = members;
 	    }
 	  }
 	  
@@ -225,7 +239,7 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	   * another member, it also has every message that member sent before. It is a barrier.
 	   */
 	  static byte[] encodeViewFlush(String senderId, long senderGeneration, String subjectId,
-	      long subjectGeneration, long lamportTimestamp) {
+	      long subjectGeneration, long lamportTimestamp, String[] members) {
 	    try {
 	      ByteArrayOutputStream raw = new ByteArrayOutputStream();
 	      DataOutputStream out = new DataOutputStream(raw);
@@ -235,6 +249,9 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	      out.writeUTF(subjectId);
 	      out.writeLong(subjectGeneration);
 	      out.writeLong(lamportTimestamp);
+	      out.writeInt(members.length);
+	      for (int i = 0; i < members.length; i++)
+	        out.writeUTF(members[i]);
 	      out.flush();
 	      return raw.toByteArray();
 	    } catch (IOException ex) {
